@@ -1,39 +1,36 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/zbus/zbus.h>
+#include <zephyr/task_wdt/task_wdt.h>
 
-LOG_MODULE_REGISTER(sensor_demo, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(reliability_demo, LOG_LEVEL_INF);
 
 #define STACK_SIZE 2048
-#define SENSOR_PERIOD_MS 100
-#define LOGGER_PERIOD_MS 500
-#define LOGGER_QUEUE_DEPTH 8
+#define QUEUE_DEPTH 8
+#define PRODUCER_PERIOD_MS 100
+#define HEALTH_PERIOD_MS 100
+#define WATCHDOG_TIMEOUT_MS 1200
+#define STALL_AFTER_SAMPLES 5
+#define STALL_DURATION_MS 3000
 
-struct sensor_data {
+struct sensor_sample
+{
     uint32_t sequence;
     uint32_t timestamp_ms;
-    int32_t temperature_mc;
+    int32_t value;
 };
 
-static void display_listener(const struct zbus_channel *channel);
+K_MSGQ_DEFINE(sensor_queue, sizeof(struct sensor_sample), QUEUE_DEPTH, 4);
 
-ZBUS_LISTENER_DEFINE(display, display_listener);
-ZBUS_SUBSCRIBER_DEFINE(logger, LOGGER_QUEUE_DEPTH);
+static int consumer_watchdog;
 
-ZBUS_CHAN_DEFINE(sensor_channel, struct sensor_data, NULL, NULL,
-                 ZBUS_OBSERVERS(display, logger),
-                 ZBUS_MSG_INIT(.sequence = 0, .timestamp_ms = 0,
-                               .temperature_mc = 0));
-
-static void display_listener(const struct zbus_channel *channel)
+static void watchdog_callback(int channel_id, void *user_data)
 {
-    const struct sensor_data *sample = zbus_chan_const_msg(channel);
-
-    LOG_INF("[DISPLAY] seq=%u temp=%d mC tick=%u",
-            sample->sequence, sample->temperature_mc, sample->timestamp_ms);
+    ARG_UNUSED(user_data);
+    LOG_ERR("[WATCHDOG] consumer timed out, channel=%d tick=%u",
+            channel_id, k_uptime_get_32());
 }
 
-static void sensor_sim_fn(void *unused1, void *unused2, void *unused3)
+static void producer_fn(void *unused1, void *unused2, void *unused3)
 {
     uint32_t sequence = 0;
 
@@ -42,62 +39,117 @@ static void sensor_sim_fn(void *unused1, void *unused2, void *unused3)
     ARG_UNUSED(unused3);
 
     while (true) {
-        struct sensor_data sample = {
+        struct sensor_sample sample = {
             .sequence = sequence,
             .timestamp_ms = k_uptime_get_32(),
-            .temperature_mc = 24000 + (int32_t)(sequence % 200U) * 50,
+            .value = 100 + (int32_t)(sequence % 100U),
         };
-        int result = zbus_chan_pub(&sensor_channel, &sample, K_NO_WAIT);
+        int result = k_msgq_put(&sensor_queue, &sample, K_NO_WAIT);
 
         if (result != 0) {
-            LOG_WRN("[SENSOR] publish seq=%u failed: %d", sequence, result);
+            LOG_WRN("[PRODUCER] queue full, dropped seq=%u", sequence);
+        }
+        else
+        {
+            LOG_INF("[PRODUCER] seq=%u queue=%u/%u", sequence,
+                    k_msgq_num_used_get(&sensor_queue), QUEUE_DEPTH);
         }
         sequence++;
-        k_msleep(SENSOR_PERIOD_MS);
+        k_msleep(PRODUCER_PERIOD_MS);
     }
 }
 
-static void logger_fn(void *unused1, void *unused2, void *unused3)
+static void consumer_fn(void *unused1, void *unused2, void *unused3)
 {
-    const struct zbus_channel *channel;
+    unsigned int processed = 0;
 
     ARG_UNUSED(unused1);
     ARG_UNUSED(unused2);
     ARG_UNUSED(unused3);
 
     while (true) {
-        int result = zbus_sub_wait(&logger, &channel, K_FOREVER);
+        struct sensor_sample sample;
+        int result = k_msgq_get(&sensor_queue, &sample, K_FOREVER);
 
         if (result != 0) {
-            LOG_WRN("[LOGGER] wait failed: %d", result);
+            LOG_ERR("[CONSUMER] receive failed: %d", result);
             continue;
         }
-        while (zbus_sub_wait(&logger, &channel, K_NO_WAIT) == 0) {
+        result = task_wdt_feed(consumer_watchdog);
+        if (result != 0)
+        {
+            LOG_ERR("[CONSUMER] watchdog feed failed: %d", result);
         }
+        processed++;
+        LOG_INF("[CONSUMER] seq=%u value=%d age=%u ms", sample.sequence,
+                sample.value, k_uptime_get_32() - sample.timestamp_ms);
 
-        struct sensor_data sample;
-
-        result = zbus_chan_read(channel, &sample, K_MSEC(10));
-        if (result == 0) {
-            LOG_INF("[LOGGER] seq=%u temp=%d mC sample_tick=%u log_tick=%u",
-                    sample.sequence, sample.temperature_mc,
-                    sample.timestamp_ms, k_uptime_get_32());
-        } else {
-            LOG_WRN("[LOGGER] read failed: %d", result);
+        if (processed == STALL_AFTER_SAMPLES)
+        {
+            LOG_WRN("[CONSUMER] simulating a %u ms stall", STALL_DURATION_MS);
+            k_msleep(STALL_DURATION_MS);
+            LOG_INF("[CONSUMER] resumed");
         }
-
-        k_msleep(LOGGER_PERIOD_MS);
     }
 }
 
-K_THREAD_DEFINE(sensor_thread, STACK_SIZE, sensor_sim_fn,
-                NULL, NULL, NULL, 5, 0, 0);
-K_THREAD_DEFINE(logger_thread, STACK_SIZE, logger_fn,
-                NULL, NULL, NULL, 6, 0, 0);
+static void health_fn(void *unused1, void *unused2, void *unused3)
+{
+    bool high_water = false;
+
+    ARG_UNUSED(unused1);
+    ARG_UNUSED(unused2);
+    ARG_UNUSED(unused3);
+
+    while (true)
+    {
+        uint32_t used = k_msgq_num_used_get(&sensor_queue);
+
+        if (used * 4U >= QUEUE_DEPTH * 3U)
+        {
+            if (!high_water)
+            {
+                LOG_WRN("[HEALTH] queue at or above 75%%: %u/%u", used, QUEUE_DEPTH);
+                high_water = true;
+            }
+        }
+        else if (high_water)
+        {
+            LOG_INF("[HEALTH] queue recovered: %u/%u", used, QUEUE_DEPTH);
+            high_water = false;
+        }
+        k_msleep(HEALTH_PERIOD_MS);
+    }
+}
+
+K_THREAD_DEFINE(producer_thread, STACK_SIZE, producer_fn,
+                NULL, NULL, NULL, 5, 0, -1);
+K_THREAD_DEFINE(consumer_thread, STACK_SIZE, consumer_fn,
+                NULL, NULL, NULL, 5, 0, -1);
+K_THREAD_DEFINE(health_thread, STACK_SIZE, health_fn,
+                NULL, NULL, NULL, 6, 0, -1);
 
 int main(void)
 {
-    LOG_INF("=== Zbus sensor demo ===");
+    int result = task_wdt_init(NULL);
+
+    if (result != 0)
+    {
+        LOG_ERR("[WATCHDOG] initialization failed: %d", result);
+        return result;
+    }
+
+    consumer_watchdog = task_wdt_add(WATCHDOG_TIMEOUT_MS, watchdog_callback, NULL);
+    if (consumer_watchdog < 0)
+    {
+        LOG_ERR("[WATCHDOG] channel creation failed: %d", consumer_watchdog);
+        return consumer_watchdog;
+    }
+
+    LOG_INF("=== Queue pressure and task watchdog demo ===");
+    k_thread_start(consumer_thread);
+    k_thread_start(producer_thread);
+    k_thread_start(health_thread);
     return 0;
 }
 
