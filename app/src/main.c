@@ -1,62 +1,65 @@
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
-
-LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
+#include <zephyr/sys/printk.h>
 
 #define STACK_SIZE 1024
+#define THREAD_PRIORITY 5
+#define ITERATIONS 1000
 
-#define PRIO_COOP -1
-#define PRIO_HIGH 3
-#define PRIO_MED  5
-#define PRIO_LOW  7
+K_THREAD_STACK_DEFINE(stack_one, STACK_SIZE);
+K_THREAD_STACK_DEFINE(stack_two, STACK_SIZE);
+K_MUTEX_DEFINE(counter_mutex);
 
-void t_coop_fn(void *p1, void *p2, void *p3)
+static struct k_thread thread_one;
+static struct k_thread thread_two;
+static volatile unsigned int counter;
+
+static void increment_counter(void *protected, void *unused1, void *unused2)
 {
-    while (1) {
-        for (int i = 0; i < 5; i++) {
-            LOG_INF("T_COOP busy working (%d/5)", i + 1);
-            k_busy_wait(100000); /* 100 ms busy wait */
+    bool use_mutex = protected != NULL;
+
+    ARG_UNUSED(unused1);
+    ARG_UNUSED(unused2);
+
+    for (int iteration = 0; iteration < ITERATIONS; iteration++)
+    {
+        if (use_mutex)
+        {
+            k_mutex_lock(&counter_mutex, K_FOREVER);
         }
-        LOG_INF("T_COOP yielding");
+
+        unsigned int value = counter;
         k_yield();
+        counter = value + 1;
+
+        if (use_mutex)
+        {
+            k_mutex_unlock(&counter_mutex);
+        }
     }
 }
 
-void t_low_fn(void *p1, void *p2, void *p3)
+static void run_test(bool use_mutex)
 {
-    while (1) {
-        LOG_INF("T_LOW running");
-        k_msleep(300);
-    }
-}
+    counter = 0;
 
-void t_med_fn(void *p1, void *p2, void *p3)
-{
-    while (1) {
-        LOG_INF("T_MED running");
-        k_msleep(200);
-    }
-}
+    k_thread_create(&thread_one, stack_one, STACK_SIZE, increment_counter,
+                    use_mutex ? &counter_mutex : NULL, NULL, NULL,
+                    THREAD_PRIORITY, 0, K_NO_WAIT);
+    k_thread_create(&thread_two, stack_two, STACK_SIZE, increment_counter,
+                    use_mutex ? &counter_mutex : NULL, NULL, NULL,
+                    THREAD_PRIORITY, 0, K_NO_WAIT);
 
-void t_high_fn(void *p1, void *p2, void *p3)
-{
-    while (1) {
-        LOG_INF("T_HIGH running");
-        k_msleep(100);
-    }
-}
+    k_thread_join(&thread_one, K_FOREVER);
+    k_thread_join(&thread_two, K_FOREVER);
 
-K_THREAD_DEFINE(t_coop, STACK_SIZE, t_coop_fn,
-                NULL, NULL, NULL, PRIO_COOP, 0, 0);
-K_THREAD_DEFINE(t_high, STACK_SIZE, t_high_fn,
-                NULL, NULL, NULL, PRIO_HIGH, 0, 0);
-K_THREAD_DEFINE(t_med, STACK_SIZE, t_med_fn,
-                NULL, NULL, NULL, PRIO_MED, 0, 0);
-K_THREAD_DEFINE(t_low, STACK_SIZE, t_low_fn,
-                NULL, NULL, NULL, PRIO_LOW, 0, 0);
+    printk("%s: expected %u, got %u\n",
+           use_mutex ? "With mutex" : "Without mutex", 2U * ITERATIONS, counter);
+}
 
 int main(void)
 {
+    run_test(false);
+    run_test(true);
     return 0;
 }
 
