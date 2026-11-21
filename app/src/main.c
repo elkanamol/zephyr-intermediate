@@ -12,14 +12,12 @@ LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
 
 void t_coop_fn(void *p1, void *p2, void *p3)
 {
-    while (1) {
-        for (int i = 0; i < 5; i++) {
-            LOG_INF("T_COOP busy working (%d/5)", i + 1);
-            k_busy_wait(100000); /* 100 ms busy wait */
-        }
-        LOG_INF("T_COOP yielding");
-        k_yield();
+    for (int i = 0; i < 5; i++) {
+        LOG_INF("T_COOP busy working (%d/5)", i + 1);
+        k_busy_wait(100000); /* 100 ms busy wait */
     }
+    LOG_INF("T_COOP yielding");
+    k_yield();
 }
 
 void t_low_fn(void *p1, void *p2, void *p3)
@@ -59,4 +57,3 @@ int main(void)
 {
     return 0;
 }
-
