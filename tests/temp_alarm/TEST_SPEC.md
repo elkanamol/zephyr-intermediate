@@ -113,4 +113,5 @@ and `status.last_error == -EIO` (the last error is kept until a reset).
 **Verify #3:** both calls return exactly `-EINVAL`.
 
 **Verify #4:** both calls return exactly `-EINVAL`, and the rejected values
-did not change the threshold: 30 C is still in force.
+did not change the threshold: after both calls, 30 C must not raise the alarm,
+and 31 C must raise it.

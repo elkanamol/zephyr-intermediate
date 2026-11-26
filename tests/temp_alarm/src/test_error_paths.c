@@ -127,9 +127,13 @@ ZTEST(temp_alarm_invalid_input, test_set_threshold_out_of_range)
 	zassert_equal(temp_alarm_set_threshold(101), -EINVAL,
 		      "set_threshold(101) must return -EINVAL");
 
-	sensor_fake_set_temperature(20);
-	zassert_ok(temp_alarm_check(), "check must succeed after rejected thresholds");
+	sensor_fake_set_temperature(DEFAULT_THRESHOLD);
+	zassert_ok(temp_alarm_check(), "check at the original threshold must succeed");
 	zassert_ok(temp_alarm_get_status(&status), "get_status must succeed");
-	zassert_false(status.is_alarming,
-		      "20 C must remain below the original 30 C threshold");
+	zassert_false(status.is_alarming, "30 C must not alarm after rejected thresholds");
+
+	sensor_fake_set_temperature(DEFAULT_THRESHOLD + 1);
+	zassert_ok(temp_alarm_check(), "check above the original threshold must succeed");
+	zassert_ok(temp_alarm_get_status(&status), "get_status must succeed");
+	zassert_true(status.is_alarming, "31 C must alarm after rejected thresholds");
 }
